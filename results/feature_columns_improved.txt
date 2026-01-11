@@ -1,0 +1,15 @@
+odds_1x2_home
+odds_1x2_draw
+odds_1x2_away
+odds_btts_yes
+odds_btts_no
+implied_prob_home
+implied_prob_draw
+implied_prob_away
+h2h_total
+h2h_home_wins
+h2h_away_wins
+h2h_draws
+h2h_home_win_pct
+h2h_away_win_pct
+h2h_draw_pct
