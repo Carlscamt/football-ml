@@ -631,15 +631,32 @@ def process_data_extended(input_path: str, output_path: str) -> pd.DataFrame:
 # CLI ENTRY POINT
 # =============================================================================
 
+def find_latest_raw_file():
+    """Find the most recent CSV file in data/raw/"""
+    raw_dir = 'data/raw'
+    if not os.path.exists(raw_dir):
+        return None
+    files = [f for f in os.listdir(raw_dir) if f.endswith('.csv')]
+    if not files:
+        return None
+    # Sort by filename (which includes date) and return newest
+    return os.path.join(raw_dir, sorted(files)[-1])
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description='Enhanced Football ML Data Pipeline (ALL Features)'
     )
+    
+    # Auto-find latest file
+    default_input = find_latest_raw_file()
+    if default_input is None:
+        default_input = 'data/raw/sofascore_data.csv'
+    
     parser.add_argument(
         '--input', '-i',
         type=str,
-        default='data/raw/sofascore_parallel_6lg_3yr_2434matches.csv',
-        help='Input CSV path'
+        default=default_input,
+        help='Input CSV path (default: latest file in data/raw/)'
     )
     parser.add_argument(
         '--output', '-o',
@@ -650,4 +667,5 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
+    print(f"Using input file: {args.input}")
     df = process_data_extended(args.input, args.output)

@@ -48,9 +48,18 @@ warnings.filterwarnings('ignore')
 # CONFIGURATION - IMPROVED PARAMETERS
 # =============================================================================
 
-# File paths
+def find_latest_file(directory, pattern='*.csv'):
+    """Find the most recent CSV file in a directory."""
+    import glob
+    files = glob.glob(os.path.join(directory, pattern))
+    if not files:
+        return None
+    return sorted(files)[-1]
+
+# File paths - auto-find latest files
 PROCESSED_DATA = 'data/processed/processed_features_extended.csv'
-FUTURE_DATA = 'data/predictions/sofascore_future_6lg_58matches_20260111.csv'
+_future_file = find_latest_file('data/predictions', 'sofascore_future_*.csv')
+FUTURE_DATA = _future_file if _future_file else 'data/predictions/sofascore_future.csv'
 
 # Temporal split dates
 TRAIN_CUTOFF = '2024-08-01'
@@ -406,7 +415,7 @@ def evaluate_model(model, X_train, y_train, X_valid, y_valid, X_test, y_test, fe
 # =============================================================================
 
 def predict_future_matches(model, scaler, feature_cols, df_historical):
-    """Predict outcomes for future matches."""
+    """Predict outcomes for future matches with FULL feature engineering."""
     print_separator("STEP 7: PREDICTING FUTURE MATCHES")
     
     if not os.path.exists(FUTURE_DATA):
@@ -416,28 +425,155 @@ def predict_future_matches(model, scaler, feature_cols, df_historical):
     df_future = pd.read_csv(FUTURE_DATA)
     print(f"Loaded {len(df_future)} future matches")
     
-    # Compute features from historical data
+    # Load processed historical data
     df_hist = pd.read_csv(PROCESSED_DATA)
+    df_hist['date'] = pd.to_datetime(df_hist['date'])
+    
+    # =========================================================================
+    # STEP 1: Calculate derived odds features
+    # =========================================================================
+    print("\n  Calculating derived odds features...")
+    
+    for col in ['odds_1x2_home', 'odds_1x2_draw', 'odds_1x2_away']:
+        if col not in df_future.columns:
+            df_future[col] = 2.0  # Default if missing
+    
+    # Implied probabilities
+    df_future['implied_prob_home'] = 1.0 / df_future['odds_1x2_home']
+    df_future['implied_prob_draw'] = 1.0 / df_future['odds_1x2_draw']
+    df_future['implied_prob_away'] = 1.0 / df_future['odds_1x2_away']
+    
+    # Log odds
+    df_future['log_odds_home'] = np.log(df_future['odds_1x2_home'].clip(lower=1.01))
+    df_future['log_odds_draw'] = np.log(df_future['odds_1x2_draw'].clip(lower=1.01))
+    df_future['log_odds_away'] = np.log(df_future['odds_1x2_away'].clip(lower=1.01))
+    
+    # Overround
+    df_future['overround'] = df_future['implied_prob_home'] + df_future['implied_prob_draw'] + df_future['implied_prob_away']
+    
+    # BTTS odds (use defaults if not present)
+    if 'odds_btts_yes' not in df_future.columns:
+        df_future['odds_btts_yes'] = 1.85
+    if 'odds_btts_no' not in df_future.columns:
+        df_future['odds_btts_no'] = 1.95
+    
+    # =========================================================================
+    # STEP 2: Build feature matrix with proper imputation
+    # =========================================================================
+    print("  Building feature matrix with team-specific imputation...")
     
     X_future = np.zeros((len(df_future), len(feature_cols)))
+    feature_sources = {'direct': 0, 'team_hist': 0, 'global': 0}
     
     for idx, future_row in df_future.iterrows():
-        home_team_id = future_row['home_team_id']
-        away_team_id = future_row['away_team_id']
+        home_team_id = future_row.get('home_team_id')
+        away_team_id = future_row.get('away_team_id')
+        home_team = future_row.get('home_team')
+        away_team = future_row.get('away_team')
         
-        home_matches = df_hist[df_hist['home_team_id'] == home_team_id].tail(10)
-        away_matches = df_hist[df_hist['away_team_id'] == away_team_id].tail(10)
+        # Get historical matches for EACH team (both home and away appearances)
+        if pd.notna(home_team_id):
+            home_team_matches = df_hist[
+                (df_hist['home_team_id'] == home_team_id) | 
+                (df_hist['away_team_id'] == home_team_id)
+            ].tail(10)
+        else:
+            home_team_matches = df_hist[
+                (df_hist['home_team'] == home_team) | 
+                (df_hist['away_team'] == home_team)
+            ].tail(10)
+        
+        if pd.notna(away_team_id):
+            away_team_matches = df_hist[
+                (df_hist['home_team_id'] == away_team_id) | 
+                (df_hist['away_team_id'] == away_team_id)
+            ].tail(10)
+        else:
+            away_team_matches = df_hist[
+                (df_hist['home_team'] == away_team) | 
+                (df_hist['away_team'] == away_team)
+            ].tail(10)
         
         for j, feat in enumerate(feature_cols):
+            # Priority 1: Direct from future data (odds, derived odds)
             if feat in df_future.columns and pd.notna(future_row.get(feat)):
                 X_future[idx, j] = future_row[feat]
-            elif 'home_' in feat and feat in df_hist.columns and len(home_matches) > 0:
-                X_future[idx, j] = home_matches[feat].mean()
-            elif 'away_' in feat and feat in df_hist.columns and len(away_matches) > 0:
-                X_future[idx, j] = away_matches[feat].mean()
+                if idx == 0:
+                    feature_sources['direct'] += 1
+            
+            # Priority 2: Team-specific historical imputation
             elif feat in df_hist.columns:
-                X_future[idx, j] = df_hist[feat].mean()
+                value = None
+                
+                # For "home_" prefixed features, use the home team's history
+                if feat.startswith('home_') and len(home_team_matches) > 0:
+                    # Get the team's stats when they played at home
+                    home_as_home = home_team_matches[home_team_matches['home_team'] == home_team]
+                    if len(home_as_home) > 0 and feat in home_as_home.columns:
+                        value = home_as_home[feat].mean()
+                    elif feat in home_team_matches.columns:
+                        value = home_team_matches[feat].mean()
+                
+                # For "away_" prefixed features, use the away team's history  
+                elif feat.startswith('away_') and len(away_team_matches) > 0:
+                    # Get the team's stats when they played away
+                    away_as_away = away_team_matches[away_team_matches['away_team'] == away_team]
+                    if len(away_as_away) > 0 and feat in away_as_away.columns:
+                        value = away_as_away[feat].mean()
+                    elif feat in away_team_matches.columns:
+                        value = away_team_matches[feat].mean()
+                
+                # For streak features
+                elif 'streak_home_' in feat and len(home_team_matches) > 0:
+                    value = home_team_matches[feat].iloc[-1] if feat in home_team_matches.columns else None
+                elif 'streak_away_' in feat and len(away_team_matches) > 0:
+                    value = away_team_matches[feat].iloc[-1] if feat in away_team_matches.columns else None
+                elif 'streak_both_' in feat:
+                    # Use average of both teams
+                    vals = []
+                    if len(home_team_matches) > 0 and feat in home_team_matches.columns:
+                        vals.append(home_team_matches[feat].iloc[-1])
+                    if len(away_team_matches) > 0 and feat in away_team_matches.columns:
+                        vals.append(away_team_matches[feat].iloc[-1])
+                    value = np.mean(vals) if vals else None
+                
+                # For H2H features
+                elif feat.startswith('h2h_'):
+                    # Find matches between these two teams
+                    if pd.notna(home_team_id) and pd.notna(away_team_id):
+                        h2h = df_hist[
+                            ((df_hist['home_team_id'] == home_team_id) & (df_hist['away_team_id'] == away_team_id)) |
+                            ((df_hist['home_team_id'] == away_team_id) & (df_hist['away_team_id'] == home_team_id))
+                        ]
+                    else:
+                        h2h = df_hist[
+                            ((df_hist['home_team'] == home_team) & (df_hist['away_team'] == away_team)) |
+                            ((df_hist['home_team'] == away_team) & (df_hist['away_team'] == home_team))
+                        ]
+                    if len(h2h) > 0 and feat in h2h.columns:
+                        value = h2h[feat].iloc[-1]
+                
+                # For high_claims features
+                elif feat.startswith('high_claims_') and len(home_team_matches) > 0:
+                    value = home_team_matches[feat].mean() if feat in home_team_matches.columns else None
+                
+                if value is not None and pd.notna(value):
+                    X_future[idx, j] = value
+                    if idx == 0:
+                        feature_sources['team_hist'] += 1
+                else:
+                    # Priority 3: Global average from all historical data
+                    X_future[idx, j] = df_hist[feat].mean() if pd.notna(df_hist[feat].mean()) else 0
+                    if idx == 0:
+                        feature_sources['global'] += 1
+            else:
+                X_future[idx, j] = 0
     
+    print(f"  Feature sources (first match): direct={feature_sources['direct']}, team_hist={feature_sources['team_hist']}, global={feature_sources['global']}")
+    
+    # =========================================================================
+    # STEP 3: Scale and predict
+    # =========================================================================
     X_future = np.nan_to_num(X_future, nan=0.0)
     X_future_scaled = scaler.transform(X_future)
     
@@ -445,6 +581,9 @@ def predict_future_matches(model, scaler, feature_cols, df_historical):
     future_probs = model.predict(dfuture)
     future_pred = map_predictions_to_classes(future_probs)
     
+    # =========================================================================
+    # STEP 4: Build output
+    # =========================================================================
     predictions = df_future[['date', 'home_team', 'away_team', 'league']].copy()
     for col in ['odds_1x2_home', 'odds_1x2_draw', 'odds_1x2_away']:
         if col in df_future.columns:
@@ -460,6 +599,12 @@ def predict_future_matches(model, scaler, feature_cols, df_historical):
     print(f"  Home wins predicted: {(future_pred == 1).sum()}")
     print(f"  Draws predicted:     {(future_pred == 0).sum()}")
     print(f"  Away wins predicted: {(future_pred == -1).sum()}")
+    print(f"\nConfidence stats:")
+    print(f"  Min: {predictions['confidence'].min()*100:.1f}%")
+    print(f"  Max: {predictions['confidence'].max()*100:.1f}%")
+    print(f"  Mean: {predictions['confidence'].mean()*100:.1f}%")
+    print(f"  >= 50%: {(predictions['confidence'] >= 0.50).sum()} matches")
+    print(f"  >= 60%: {(predictions['confidence'] >= 0.60).sum()} matches")
     
     return predictions, future_probs
 
